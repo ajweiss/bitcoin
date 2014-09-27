@@ -194,7 +194,8 @@ void SyncWithWallets(const CTransaction &tx, const CBlock *pblock) {
 // Registration of network node signals.
 //
 
-namespace {
+// disable namespace to run tests for now
+//namespace {
 
 struct CBlockReject {
     unsigned char chRejectCode;
@@ -241,6 +242,10 @@ struct CNodeState {
 // Map maintaining per-node state. Requires cs_main.
 map<NodeId, CNodeState> mapNodeState;
 
+// Maps for queueing block inv messages
+map<uint256, list<NodeId> > mapBlockInvQueue;
+map<NodeId, map<uint256, list<NodeId>::iterator> > mapBlockInvQueueByNode;
+
 // Requires cs_main.
 CNodeState *State(NodeId pnode) {
     map<NodeId, CNodeState>::iterator it = mapNodeState.find(pnode);
@@ -255,6 +260,72 @@ int GetHeight()
     return chainActive.Height();
 }
 
+// Requires cs_main.
+bool AssignBlockDownloadToNode(NodeId nodeid, const uint256 &hash) {
+    CNodeState *state = State(nodeid);
+    if (state == NULL)
+        return false;
+
+    list<uint256>::iterator it = state->vBlocksToDownload.insert(state->vBlocksToDownload.end(), hash);
+    state->nBlocksToDownload++;
+    if (state->nBlocksToDownload > 5000)
+        Misbehaving(nodeid, 10);
+    mapBlocksToDownload[hash] = std::make_pair(nodeid, it);
+    return true;
+}
+
+// Requires cs_main.
+NodeId BlockInvDequeueBestNode(const uint256 &hash) {
+    assert(!mapBlockInvQueue[hash].empty());
+    NodeId bestNode = mapBlockInvQueue[hash].front();
+    mapBlockInvQueue[hash].pop_front();
+
+    if (mapBlockInvQueue[hash].empty())
+        mapBlockInvQueue.erase(hash);
+
+    mapBlockInvQueueByNode[bestNode].erase(hash);
+
+    return bestNode;
+}
+
+// Requires cs_main.
+void TryReassignBlockDownload(const uint256 &hash) {
+    if (mapBlockInvQueue.count(hash))
+        AssignBlockDownloadToNode(BlockInvDequeueBestNode(hash), hash);
+}
+
+// Requires cs_main.
+size_t BlockInvAddToQueue(const uint256 &hash, NodeId nodeid) {
+    list<NodeId>::iterator itNode =
+        mapBlockInvQueue[hash].insert(mapBlockInvQueue[hash].end(), nodeid);
+    mapBlockInvQueueByNode[nodeid][hash] = itNode;
+    return mapBlockInvQueueByNode[nodeid].size();
+}
+
+// Requires cs_main.
+void BlockInvClearFromQueue(const uint256 &hash) {
+    if (!mapBlockInvQueue.count(hash))
+        return;
+    
+    BOOST_FOREACH(const NodeId& node, mapBlockInvQueue[hash])
+        mapBlockInvQueueByNode[node].erase(hash);
+    mapBlockInvQueue.erase(hash);
+}
+
+// Requires cs_main.
+void BlockInvForgetNode(NodeId nodeid) {
+    if (!mapBlockInvQueueByNode.count(nodeid))
+        return;
+
+    typedef const pair<const uint256, list<NodeId>::iterator> entry;
+    BOOST_FOREACH(entry &p, mapBlockInvQueueByNode[nodeid]) {
+        mapBlockInvQueue[p.first].erase(p.second);
+        if (mapBlockInvQueue[p.first].empty())
+            mapBlockInvQueue.erase(p.first);
+    }
+    mapBlockInvQueueByNode.erase(nodeid);
+}
+
 void InitializeNode(NodeId nodeid, const CNode *pnode) {
     LOCK(cs_main);
     CNodeState &state = mapNodeState.insert(std::make_pair(nodeid, CNodeState())).first->second;
@@ -265,10 +336,15 @@ void FinalizeNode(NodeId nodeid) {
     LOCK(cs_main);
     CNodeState *state = State(nodeid);
 
-    BOOST_FOREACH(const QueuedBlock& entry, state->vBlocksInFlight)
+    BlockInvForgetNode(nodeid);
+    BOOST_FOREACH(const QueuedBlock& entry, state->vBlocksInFlight) {
         mapBlocksInFlight.erase(entry.hash);
-    BOOST_FOREACH(const uint256& hash, state->vBlocksToDownload)
+        TryReassignBlockDownload(entry.hash);
+    }
+    BOOST_FOREACH(const uint256& hash, state->vBlocksToDownload) {
         mapBlocksToDownload.erase(hash);
+        TryReassignBlockDownload(hash);
+    }
     EraseOrphansFor(nodeid);
 
     mapNodeState.erase(nodeid);
@@ -293,23 +369,23 @@ void MarkBlockAsReceived(const uint256 &hash, NodeId nodeFrom = -1) {
             state->nLastBlockReceive = GetTimeMicros();
         mapBlocksInFlight.erase(itInFlight);
     }
+
+    // if nodeFrom is not -1, we actually got the block
+    // clear it completely from the block inv queue
+    if (nodeFrom != -1)
+        BlockInvClearFromQueue(hash);
 }
 
 // Requires cs_main.
 bool AddBlockToQueue(NodeId nodeid, const uint256 &hash) {
-    if (mapBlocksToDownload.count(hash) || mapBlocksInFlight.count(hash))
+    // If no one knows about it, just queue it for download, otherwise
+    // stash the inv in the BlockInv Queue in case the download fails.
+    if (mapBlocksToDownload.count(hash) || mapBlocksInFlight.count(hash)) {
+        if (BlockInvAddToQueue(hash, nodeid) > 5000)
+            Misbehaving(nodeid, 10);
         return false;
-
-    CNodeState *state = State(nodeid);
-    if (state == NULL)
-        return false;
-
-    list<uint256>::iterator it = state->vBlocksToDownload.insert(state->vBlocksToDownload.end(), hash);
-    state->nBlocksToDownload++;
-    if (state->nBlocksToDownload > 5000)
-        Misbehaving(nodeid, 10);
-    mapBlocksToDownload[hash] = std::make_pair(nodeid, it);
-    return true;
+    } else
+        return AssignBlockDownloadToNode(nodeid, hash);
 }
 
 // Requires cs_main.
@@ -361,7 +437,7 @@ void UpdateBlockAvailability(NodeId nodeid, const uint256 &hash) {
     }
 }
 
-} // anon namespace
+//} // anon namespace
 
 bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats) {
     LOCK(cs_main);
@@ -4442,18 +4518,19 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->PushMessage("inv", vInv);
 
 
-        // Detect stalled peers. Require that blocks are in flight, we haven't
-        // received a (requested) block in one minute, and that all blocks are
-        // in flight for over two minutes, since we first had a chance to
-        // process an incoming block.
+        // Detect stalled peers. Require that blocks are in flight and either:
+        // * we haven't received a (requested) block in one minute and that all
+        //   blocks are in flight for over two minutes since we first had a
+        //   chance to process an incoming block
+        // * a block is in flight for over 3 minutes
         int64_t nNow = GetTimeMicros();
-        if (!pto->fDisconnect && state.nBlocksInFlight &&
-            state.nLastBlockReceive < state.nLastBlockProcess - BLOCK_DOWNLOAD_TIMEOUT*1000000 &&
-            state.vBlocksInFlight.front().nTime < state.nLastBlockProcess - 2*BLOCK_DOWNLOAD_TIMEOUT*1000000) {
+        if (!pto->fDisconnect && state.nBlocksInFlight && (
+            (state.nLastBlockReceive < state.nLastBlockProcess - BLOCK_DOWNLOAD_TIMEOUT*1000000 &&
+             state.vBlocksInFlight.front().nTime < state.nLastBlockProcess - 2*BLOCK_DOWNLOAD_TIMEOUT*1000000) ||
+            (state.vBlocksInFlight.back().nTime < nNow - 3*BLOCK_DOWNLOAD_TIMEOUT*1000000))) {
             LogPrintf("Peer %s is stalling block download, disconnecting\n", state.name);
             pto->fDisconnect = true;
         }
-
         // Update knowledge of peer's block availability.
         ProcessBlockAvailability(pto->GetId());
 
