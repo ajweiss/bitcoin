@@ -9,6 +9,9 @@
 #include "main.h"
 #include "noui.h"
 #include "util.h"
+#include "httpserver.h"
+#include "httprpc.h"
+#include "rpcserver.h"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
@@ -41,6 +44,9 @@ void WaitForShutdown(boost::thread_group* threadGroup)
         MilliSleep(200);
         fShutdown = ShutdownRequested();
     }
+    InterruptHTTPServer();
+    InterruptHTTPRPC();
+    InterruptRPC();
     if (threadGroup)
     {
         threadGroup->interrupt_all();

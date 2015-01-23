@@ -13,6 +13,8 @@
 #include "amount.h"
 #include "checkpoints.h"
 #include "compat/sanity.h"
+#include "httpserver.h"
+#include "httprpc.h"
 #include "key.h"
 #include "main.h"
 #include "miner.h"
@@ -148,7 +150,10 @@ void Shutdown()
     /// module was initialized.
     RenameThread("bitcoin-shutoff");
     mempool.AddTransactionsUpdated(1);
-    StopRPCThreads();
+
+    StopHTTPRPC();
+    StopRPC();
+    StopHTTPServer();
 #ifdef ENABLE_WALLET
     if (pwalletMain)
         pwalletMain->Flush(false);
@@ -404,13 +409,6 @@ std::string HelpMessage(HelpMessageMode mode)
     strUsage += HelpMessageOpt("-rpcport=<port>", strprintf(_("Listen for JSON-RPC connections on <port> (default: %u or testnet: %u)"), 8332, 18332));
     strUsage += HelpMessageOpt("-rpcallowip=<ip>", _("Allow JSON-RPC connections from specified source. Valid for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0) or a network/CIDR (e.g. 1.2.3.4/24). This option can be specified multiple times"));
     strUsage += HelpMessageOpt("-rpcthreads=<n>", strprintf(_("Set the number of threads to service RPC calls (default: %d)"), 4));
-    strUsage += HelpMessageOpt("-rpckeepalive", strprintf(_("RPC support for HTTP persistent connections (default: %d)"), 1));
-
-    strUsage += HelpMessageGroup(_("RPC SSL options: (see the Bitcoin Wiki for SSL setup instructions)"));
-    strUsage += HelpMessageOpt("-rpcssl", _("Use OpenSSL (https) for JSON-RPC connections"));
-    strUsage += HelpMessageOpt("-rpcsslcertificatechainfile=<file.cert>", strprintf(_("Server certificate file (default: %s)"), "server.cert"));
-    strUsage += HelpMessageOpt("-rpcsslprivatekeyfile=<file.pem>", strprintf(_("Server private key (default: %s)"), "server.pem"));
-    strUsage += HelpMessageOpt("-rpcsslciphers=<ciphers>", strprintf(_("Acceptable ciphers (default: %s)"), "TLSv1.2+HIGH:TLSv1+HIGH:!SSLv2:!aNULL:!eNULL:!3DES:@STRENGTH"));
 
     if (mode == HMM_BITCOIN_QT)
     {
@@ -896,7 +894,13 @@ bool AppInit2(boost::thread_group& threadGroup)
         uiInterface.InitMessage.connect(SetRPCWarmupStatus);
         RPCServer::OnStopped(&OnRPCStopped);
         RPCServer::OnPreCommand(&OnRPCPreCommand);
-        StartRPCThreads();
+
+        if (!StartHTTPServer(threadGroup) ||
+            !StartRPC() ||
+            !StartHTTPRPC())
+        {
+            return InitError(_("Unable to start HTTP server. See debug log for details."));
+        }
     }
 
     int64_t nStart;
