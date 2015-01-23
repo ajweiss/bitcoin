@@ -152,6 +152,7 @@ void Shutdown()
     mempool.AddTransactionsUpdated(1);
 
     StopHTTPRPC();
+    StopREST();
     StopRPC();
     StopHTTPServer();
 #ifdef ENABLE_WALLET
@@ -558,6 +559,21 @@ bool InitSanityCheck(void)
     return true;
 }
 
+bool AppInitServers(boost::thread_group& threadGroup)
+{
+    RPCServer::OnStopped(&OnRPCStopped);
+    RPCServer::OnPreCommand(&OnRPCPreCommand);
+    if (!StartHTTPServer(threadGroup))
+        return false;
+    if (!StartRPC())
+        return false;
+    if (!StartHTTPRPC())
+        return false;
+    if (GetBoolArg("-rest", false) && !StartREST())
+        return false;
+    return true;
+}
+
 /** Initialize bitcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
@@ -892,15 +908,8 @@ bool AppInit2(boost::thread_group& threadGroup)
     if (fServer)
     {
         uiInterface.InitMessage.connect(SetRPCWarmupStatus);
-        RPCServer::OnStopped(&OnRPCStopped);
-        RPCServer::OnPreCommand(&OnRPCPreCommand);
-
-        if (!StartHTTPServer(threadGroup) ||
-            !StartRPC() ||
-            !StartHTTPRPC())
-        {
+        if (!AppInitServers(threadGroup))
             return InitError(_("Unable to start HTTP server. See debug log for details."));
-        }
     }
 
     int64_t nStart;
