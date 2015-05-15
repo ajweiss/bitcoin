@@ -378,6 +378,16 @@ bool StartHTTPServer(boost::thread_group& threadGroup)
     for (int i = 0; i < rpcThreads; i++)
         threadGroup.create_thread(boost::bind(&HTTPWorkQueueRun, workQueue));
 
+    // This pause delays the setting of eventBase (RegisterHTTPHandler()
+    // further up the stack) thereby resulting in HTTP requests that
+    // generate a 404 which then get dropped on during reply because
+    // eventBase is still NULL.
+    //
+    // Trigger with any RPC test (listtransactions.py works)
+    //
+    // Without the added asserts, libevent will emit a warning
+    // to stderr.
+    MilliSleep(5000);
     eventBase = base;
     eventHTTP = http;
     return true;
@@ -514,6 +524,8 @@ private:
 void HTTPRequest::WriteReply(int nStatus, const std::string& strReply)
 {
     assert(!replySent && req);
+    fprintf(stderr, "status: %d = 404 because RegisterHTTPHandler() hasn't happened yet\n", nStatus);
+    assert(eventBase);
     // Send event to main http thread to send reply message
     struct evbuffer* evb = evhttp_request_get_output_buffer(req);
     assert(evb);

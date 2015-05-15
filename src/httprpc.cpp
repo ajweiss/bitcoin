@@ -21,6 +21,7 @@ class HTTPRPCTimer : public RPCTimerBase
 public:
     HTTPRPCTimer(struct event_base* eventBase, boost::function<void(void)>& func, int64_t seconds) : ev(eventBase, false, new Handler(func))
     {
+        assert(eventBase);
         struct timeval tv = {seconds, 0};
         ev.trigger(&tv);
     }
@@ -76,6 +77,7 @@ static void JSONErrorReply(HTTPRequest* req, const json_spirit::Object& objError
 
     std::string strReply = JSONRPCReply(json_spirit::Value::null, objError, id);
 
+    assert(EventBase());
     req->WriteHeader("Content-Type", "application/json");
     req->WriteReply(nStatus, strReply);
 }
@@ -149,6 +151,7 @@ static bool HTTPReq_JSONRPC(HTTPRequest* req, const std::string &)
             throw JSONRPCError(RPC_PARSE_ERROR, "Top-level object parse error");
 
         req->WriteHeader("Content-Type", "application/json");
+        assert(EventBase());
         req->WriteReply(HTTP_OK, strReply);
     } catch (const json_spirit::Object& objError) {
         JSONErrorReply(req, objError, jreq.id);
